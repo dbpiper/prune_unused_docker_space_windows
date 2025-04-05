@@ -6,10 +6,8 @@ import subprocess
 import win32serviceutil
 import win32service
 import win32event
-import win32evtlogutil
-import win32evtlog  # For error type constants.
+import win32api
 import win32con
-from concurrent.futures import ThreadPoolExecutor
 
 # Fixed log file and startup file locations.
 FIXED_LOG_FILE = r"C:\Temp\maintenance_service.log"
@@ -57,12 +55,12 @@ def write_startup_file() -> None:
 
 def get_docker_vhd_path() -> list:
     r"""
-    Returns the Docker VHD file path for user 'david' located at:
-    C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhd
+    Returns the Docker VHDX file path for user 'david' located at:
+    C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhdx
     """
     vhd_paths = []
     target_path = (
-        r"C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhd"
+        r"C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
     )
     write_local_log(f"DEBUG: Checking for Docker VHD at: {target_path}")
     if os.path.isfile(target_path):
@@ -78,35 +76,33 @@ class DockerMaintenanceService(win32serviceutil.ServiceFramework):
     _svc_display_name_ = "Docker Maintenance Service"
 
     def __init__(self, args):
-        win32serviceutil.ServiceFramework.__init__(self, args)
+        super().__init__(args)
         self.stop_event = win32event.CreateEvent(None, 0, 0, None)
         self.is_running = True
+
+    def log_event(self, message: str, eventType=None) -> None:
+        write_local_log(message)
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         self.is_running = False
         win32event.SetEvent(self.stop_event)
-        self.log_event("Service stop requested.")
+        write_local_log("Service stop requested.")
 
     def SvcDoRun(self):
         try:
-            # Clear old logs and write startup file.
             clear_log_file()
             write_startup_file()
+            # Let SCM know we’re up and running
+            self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+
             write_local_log("DEBUG: SvcDoRun() entered.")
-            write_local_log(
-                "DEBUG: Skipped servicemanager.LogMsg in SvcDoRun()."
-            )
             self.log_event("Service started.")
-            write_local_log("DEBUG: After self.log_event('Service started.')")
             self.log_event(
                 "Service environment PATH: " + os.environ.get("PATH", "")
             )
-            write_local_log("DEBUG: After logging environment PATH.")
             self.log_event("DEBUG: Starting immediate maintenance tasks.")
-            write_local_log("DEBUG: Before calling run_maintenance_tasks().")
             self.run_maintenance_tasks()
-            write_local_log("DEBUG: After calling run_maintenance_tasks().")
             self.main()
         except Exception as e:
             write_local_log("Exception in SvcDoRun: " + str(e))
@@ -140,10 +136,7 @@ class DockerMaintenanceService(win32serviceutil.ServiceFramework):
             self.run_command("docker", "info")
             return True
         except Exception as e:
-            self.log_event(
-                "Docker daemon is not running: " + str(e),
-                eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-            )
+            write_local_log("Docker daemon is not running: " + str(e))
             return False
 
     def run_maintenance_tasks(self):
@@ -153,88 +146,143 @@ class DockerMaintenanceService(win32serviceutil.ServiceFramework):
                 + str(datetime.datetime.now())
             )
             if not self.check_docker_running():
-                self.log_event(
-                    "Docker is not running; attempting to start Docker Desktop.",
-                    eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+                write_local_log(
+                    "Docker is not running; attempting to start Docker Desktop."
                 )
                 docker_desktop_path = (
                     r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
                 )
                 self.start_docker_desktop(docker_desktop_path)
-                self.log_event("Waiting 60 seconds for Docker to start...")
+                write_local_log("Waiting 60 seconds for Docker to start...")
                 time.sleep(60)
                 if not self.check_docker_running():
-                    self.log_event(
-                        "Docker still isn't running after attempting to start it.",
-                        eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+                    write_local_log(
+                        "Docker still isn't running after attempting to start it."
                     )
                     return
                 else:
-                    self.log_event("Docker is now running.")
+                    write_local_log("Docker is now running.")
+
             container_count_before = self.get_docker_container_count()
-            self.log_event(
+            write_local_log(
                 "Docker container count before prune: "
                 + str(container_count_before)
             )
             prune_output = self.run_command(
                 "powershell", "docker system prune -a --volumes --force"
             )
-            self.log_event("Docker prune output: " + prune_output)
+            write_local_log("Docker prune output: " + prune_output)
             container_count_after = self.get_docker_container_count()
-            self.log_event(
+            write_local_log(
                 "Docker container count after prune: "
                 + str(container_count_after)
             )
             removed_containers = container_count_before - container_count_after
-            self.log_event(
-                "Removed {} docker containers during prune.".format(
-                    removed_containers
-                )
+            write_local_log(
+                f"Removed {removed_containers} docker containers during prune."
             )
             self.kill_docker_processes()
-            try:
-                wsl_output = self.run_command("wsl", "--shutdown")
-                self.log_event("WSL shutdown executed. Output: " + wsl_output)
-            except Exception as e:
-                self.log_event(
-                    "WSL shutdown failed, continuing: " + str(e),
-                    eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-                )
+
+            # Stop the WSL service so the VHDX isn’t locked
+            write_local_log("Stopping WSL service (WslService).")
+            self.run_command("powershell", "Stop-Service WslService -Force")
+            write_local_log("WslService stopped.")
+
             vhd_paths = get_docker_vhd_path()
             if not vhd_paths:
-                self.log_event(
-                    "No Docker VHD files found for user 'david'.",
-                    eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-                )
+                write_local_log("No Docker VHD files found for user 'david'.")
             else:
                 for path in vhd_paths:
                     optimize_cmd = f'Optimize-VHD -Path "{path}" -Mode Full'
-                    self.log_event("Optimizing VHD: " + path)
+                    write_local_log("Optimizing VHD: " + path)
                     self.run_command("powershell", optimize_cmd)
-                    self.log_event(
+                    write_local_log(
                         "Docker VHD optimization executed for: " + path
                     )
+
+            # Restart the WSL service and wait for it
+            write_local_log("Starting WSL service (WslService).")
+            self.run_command("powershell", "Start-Service WslService")
+            write_local_log("WslService start requested.")
+            write_local_log(
+                "DEBUG: Waiting for WslService to reach 'Running' state with timeout."
+            )
+            start_time = time.time()
+            timeout = 60  # seconds
+            while True:
+                try:
+                    status = self.run_command(
+                        "powershell", "(Get-Service WslService).Status"
+                    ).strip()
+                except Exception as e:
+                    write_local_log(
+                        "ERROR: Failed to query WslService status: " + str(e)
+                    )
+                    break
+                if status == "Running":
+                    write_local_log("WslService is now running.")
+                    break
+                if time.time() - start_time > timeout:
+                    write_local_log(
+                        f"ERROR: Timeout waiting for WslService to start after {timeout} seconds."
+                    )
+                    break
+                time.sleep(1)
+
+            # Enhanced WSL status check: verify WSL operational status by executing a simple WSL command.
+            try:
+                wsl_check_output = self.run_command("wsl.exe", "-l")
+                if not wsl_check_output:
+                    write_local_log(
+                        "ERROR: WSL command returned empty output. WSL might not be operational."
+                    )
+                else:
+                    write_local_log(
+                        "WSL operational check succeeded. Output: "
+                        + wsl_check_output
+                    )
+            except Exception as e:
+                write_local_log(
+                    "ERROR: Exception during WSL operational check: " + str(e)
+                )
+
+            # Now start Docker Desktop
             docker_desktop_path = (
                 r"C:\Program Files\Docker\Docker\Docker Desktop.exe"
             )
             self.start_docker_desktop(docker_desktop_path)
-            self.log_event("Docker Desktop restarted minimized.")
-            self.log_event("DEBUG: Maintenance tasks completed successfully.")
-        except Exception as e:
-            self.log_event(
-                "Error during maintenance tasks: " + str(e),
-                eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+            write_local_log(
+                "Docker Desktop restart attempted with exponential backoff."
             )
+
+            # Additional check: if Docker daemon still isn't responsive, attempt one extra restart
+            if not self.check_docker_running():
+                write_local_log(
+                    "WARNING: Docker daemon still not accessible after startup attempt. Attempting one additional restart."
+                )
+                self.kill_docker_processes()
+                self.start_docker_desktop(docker_desktop_path)
+                if self.check_docker_running():
+                    write_local_log(
+                        "Docker daemon responsive after additional restart."
+                    )
+                else:
+                    write_local_log(
+                        "ERROR: Docker daemon still not responsive after additional restart."
+                    )
+
+            write_local_log("DEBUG: Maintenance tasks completed successfully.")
+        except Exception as e:
+            write_local_log("Error during maintenance tasks: " + str(e))
 
     def kill_docker_processes(self) -> None:
         for proc_name in ["docker.exe", "Docker Desktop.exe"]:
             try:
                 self.kill_process(proc_name)
-                self.log_event(f"Killed {proc_name} processes if any.")
+                write_local_log(f"Killed {proc_name} processes if any.")
             except Exception as e:
-                self.log_event(
-                    f"Failed to kill process {proc_name}: " + str(e),
-                    eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+                write_local_log(
+                    f"Failed to kill process {proc_name}: {str(e)}"
                 )
 
     def get_docker_container_count(self) -> int:
@@ -252,14 +300,11 @@ class DockerMaintenanceService(win32serviceutil.ServiceFramework):
             ]
             return len(container_ids)
         except Exception as e:
-            self.log_event(
-                "Failed to get docker container count: " + str(e),
-                eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-            )
+            write_local_log("Failed to get docker container count: " + str(e))
             return 0
 
     def run_command(self, command: str, args: str) -> str:
-        self.log_event("DEBUG: Executing command: {} {}".format(command, args))
+        write_local_log(f"DEBUG: Executing command: {command} {args}")
         if command.lower() == "powershell":
             cmd = [command, "-Command", args]
         else:
@@ -270,107 +315,115 @@ class DockerMaintenanceService(win32serviceutil.ServiceFramework):
             )
         except subprocess.TimeoutExpired:
             error_msg = f"Command timeout expired: {command} {args}"
-            self.log_event(
-                error_msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE
-            )
+            write_local_log(error_msg)
             raise Exception(error_msg)
         if result.returncode != 0:
-            error_msg = "Command failed: {} {}. Error: {} (Stdout: {})".format(
-                command, args, result.stderr, result.stdout
-            )
-            self.log_event(
-                error_msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE
-            )
+            error_msg = f"Command failed: {command} {args}. Error: {result.stderr} (Stdout: {result.stdout})"
+            write_local_log(error_msg)
             raise Exception(error_msg)
         output = result.stdout.strip()
-        self.log_event("DEBUG: Command output: " + output)
+        write_local_log("DEBUG: Command output: " + output)
         return output
 
     def kill_process(self, process_name: str) -> None:
-        self.log_event("DEBUG: Killing processes named: " + process_name)
+        write_local_log("DEBUG: Killing processes named: " + process_name)
         result = subprocess.run(
             ["taskkill", "/F", "/IM", process_name],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        self.log_event("Taskkill output: " + result.stdout.strip())
+        write_local_log("Taskkill output: " + result.stdout.strip())
 
     def start_docker_desktop(self, executable_path: str) -> None:
         """
-        Attempts to start Docker Desktop using the Windows 'start' command via cmd
-        so that it launches in an interactive session under user 'david'.
-        This method logs detailed diagnostic information and uses a retry mechanism.
-        Note: To fully run as your user "david", configure the service’s “Log On” account in
-        the Windows Services console (services.msc) to use your user account.
+        Attempts to start Docker Desktop using ShellExecute via win32api.
+        Implements exponential backoff on retries and verifies Docker daemon responsiveness.
         """
         max_retries = 3
-        retry_delay = 5  # seconds between attempts
+        retry_delay = 5  # seconds
         attempt = 0
-        self.log_event(
-            "DEBUG: Attempting to start Docker Desktop via cmd: "
-            + executable_path
+        write_local_log(
+            "DEBUG: Attempting to start Docker Desktop: " + executable_path
         )
         if not os.path.exists(executable_path):
-            self.log_event(
+            write_local_log(
                 "ERROR: Docker Desktop executable not found: "
-                + executable_path,
-                eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+                + executable_path
             )
             return
+
         while attempt < max_retries:
             try:
-                # Use the Windows "start" command via cmd with an empty title.
-                cmd = f'cmd /c start "" "{executable_path}"'
-                self.log_event("DEBUG: Running command: " + cmd)
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, shell=True, timeout=30
+                win32api.ShellExecute(
+                    0,
+                    "open",
+                    executable_path,
+                    None,
+                    None,
+                    win32con.SW_SHOWNORMAL,
                 )
-                self.log_event(
-                    "DEBUG: Docker Desktop start stdout: " + result.stdout
+                write_local_log(
+                    f"DEBUG: ShellExecute() succeeded (Attempt {attempt+1})."
                 )
-                self.log_event(
-                    "DEBUG: Docker Desktop start stderr: " + result.stderr
+            except Exception as e:
+                write_local_log(
+                    f"ERROR: ShellExecute() failed on attempt {attempt+1}: {str(e)}"
                 )
-                time.sleep(retry_delay)
-                # Use tasklist to check if Docker Desktop is running.
-                tasklist = subprocess.run(
-                    'tasklist /FI "IMAGENAME eq Docker Desktop.exe"',
-                    capture_output=True,
-                    text=True,
-                    shell=True,
+            # Wait before checking if the process is running.
+            time.sleep(retry_delay)
+            tasklist = subprocess.run(
+                'tasklist /FI "IMAGENAME eq Docker Desktop.exe"',
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+            if "Docker Desktop.exe" in tasklist.stdout:
+                write_local_log(
+                    f"DEBUG: Docker Desktop is running (Attempt {attempt+1})."
                 )
-                if "Docker Desktop.exe" in tasklist.stdout:
-                    self.log_event(
-                        f"DEBUG: Docker Desktop is running (Attempt {attempt+1})."
+                # Verify Docker daemon responsiveness.
+                try:
+                    self.run_command("docker", "info")
+                    write_local_log(
+                        "Docker daemon is responsive after startup."
                     )
                     return
-                else:
-                    self.log_event(
-                        f"ERROR: Docker Desktop does not appear to be running (Attempt {attempt+1}).",
-                        eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+                except Exception as e:
+                    write_local_log(
+                        "ERROR: Docker daemon not responsive: " + str(e)
                     )
-            except Exception as e:
-                self.log_event(
-                    f"ERROR: Failed to start Docker Desktop on attempt {attempt+1}: {str(e)}",
-                    eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+            else:
+                write_local_log(
+                    f"ERROR: Docker Desktop does not appear to be running (Attempt {attempt+1})."
                 )
             attempt += 1
-            self.log_event(
+            retry_delay *= 2
+            write_local_log(
                 f"DEBUG: Retrying Docker Desktop launch in {retry_delay} seconds..."
             )
             time.sleep(retry_delay)
-        self.log_event(
-            "ERROR: Failed to start Docker Desktop after maximum retries.",
-            eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
+        write_local_log(
+            "ERROR: Failed to start Docker Desktop after maximum retries."
         )
-
-    def log_event(
-        self, message: str, eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE
-    ) -> None:
-        write_local_log(message)
 
 
 if __name__ == "__main__":
-    # Note: To fully run as your user "david", configure the service’s “Log On” account in the Windows Services console to use your user account.
+    from win32serviceutil import StopService, WaitForServiceStatus
+    from win32service import SERVICE_STOPPED
+
+    svc_name = DockerMaintenanceService._svc_name_
+    if "update" in sys.argv:
+        write_local_log(
+            "INFO: update requested, stopping service before update"
+        )
+        try:
+            StopService(svc_name)
+            WaitForServiceStatus(
+                svc_name, SERVICE_STOPPED, 30_000
+            )  # timeout in ms
+            write_local_log("INFO: service stopped successfully")
+        except Exception as e:
+            write_local_log(f"WARN: could not stop service before update: {e}")
+
     win32serviceutil.HandleCommandLine(DockerMaintenanceService)
