@@ -15,12 +15,12 @@ def log(message: str, eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE) -> None:
     print(f"{timestamp}: {message}")
 
 
-def get_docker_vhd_path() -> list:
+def get_docker_vhd_path() -> list[str]:
     r"""
     Returns the Docker VHDX file path for user 'david' located at:
     C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhdx
     """
-    vhd_paths = []
+    vhd_paths: list[str] = []
     target_path = (
         r"C:\Users\david\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
     )
@@ -41,39 +41,54 @@ class DockerMaintenance:
 
     def run_command(self, command: str, args: str) -> str:
         self.log_event(f"DEBUG: Executing command: {command} {args}")
+        # build invocation
         if command.lower() == "powershell":
             cmd = [command, "-Command", args]
         else:
             cmd = [command, args]
+
+        # spawn and stream stdout+stderr
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
+        except Exception as e:
+            msg = f"Failed to start process: {command} {args}: {e}"
+            self.log_event(msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE)
+            raise
+
+        output_lines: list[str] = []
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip()
+            # immediate console feedback
+            timestamp = datetime.datetime.now().isoformat()
+            print(f"{timestamp}: {line}")
+            output_lines.append(line)
+
+        try:
+            ret = proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            error_msg = f"Command timeout expired: {command} {args}"
-            self.log_event(
-                error_msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE
-            )
-            raise Exception(error_msg)
-        if result.returncode != 0:
-            error_msg = f"Command failed: {command} {args}. Error: {result.stderr} (Stdout: {result.stdout})"
-            self.log_event(
-                error_msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE
-            )
-            raise Exception(error_msg)
-        output = result.stdout.strip()
-        self.log_event("DEBUG: Command output: " + output)
-        return output
+            proc.kill()
+            msg = f"Command timeout expired: {command} {args}"
+            self.log_event(msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE)
+            raise
+
+        if ret != 0:
+            msg = f"Command failed: {command} {args}. Exit code: {ret}"
+            self.log_event(msg, eventType=win32evtlog.EVENTLOG_ERROR_TYPE)
+            raise Exception(msg)
+
+        return "\n".join(output_lines)
 
     def kill_process(self, process_name: str) -> None:
-        self.log_event("DEBUG: Killing processes named: " + process_name)
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", process_name],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        self.log_event("Taskkill output: " + result.stdout.strip())
+        # delegate to run_command so output streams live
+        self.log_event(f"DEBUG: Killing processes named: {process_name}")
+        self.run_command("taskkill", f"/F /IM {process_name}")
+        self.log_event(f"Killed processes named: {process_name}")
 
     def kill_docker_processes(self) -> None:
         for proc_name in ["docker.exe", "Docker Desktop.exe"]:
@@ -129,25 +144,18 @@ class DockerMaintenance:
             return
         while attempt < max_retries:
             try:
-                cmd = f'cmd /c start "" "{executable_path}"'
-                self.log_event("DEBUG: Running command: " + cmd)
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, shell=True, timeout=30
-                )
-                self.log_event(
-                    "DEBUG: Docker Desktop start stdout: " + result.stdout
-                )
-                self.log_event(
-                    "DEBUG: Docker Desktop start stderr: " + result.stderr
-                )
+                # start and stream
+                start_cmd = f'cmd /c start "" "{executable_path}"'
+                self.log_event("DEBUG: Running command: " + start_cmd)
+                self.run_command("cmd", start_cmd)
+
                 time.sleep(retry_delay)
-                tasklist = subprocess.run(
-                    'tasklist /FI "IMAGENAME eq Docker Desktop.exe"',
-                    capture_output=True,
-                    text=True,
-                    shell=True,
+
+                self.log_event("DEBUG: Checking for Docker Desktop process")
+                list_output = self.run_command(
+                    "cmd", 'tasklist /FI "IMAGENAME eq Docker Desktop.exe"'
                 )
-                if "Docker Desktop.exe" in tasklist.stdout:
+                if "Docker Desktop.exe" in list_output:
                     self.log_event(
                         f"DEBUG: Docker Desktop is running (Attempt {attempt+1})."
                     )
@@ -264,7 +272,7 @@ class DockerMaintenance:
             )
 
 
-def main():
+def main() -> None:
     log("Script started.")
     log("Environment PATH: " + os.environ.get("PATH", ""))
     dm = DockerMaintenance()
